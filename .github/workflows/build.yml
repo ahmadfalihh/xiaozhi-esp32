@@ -14,7 +14,7 @@ jobs:
         run: |
           git config --global --add safe.directory '*'
           . $IDF_PATH/export.sh
-          python scripts/release.py pocket-wall-e-c3 --name pocket-esp-ai-txfix
+          python scripts/release.py pocket-wall-e-c3
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
