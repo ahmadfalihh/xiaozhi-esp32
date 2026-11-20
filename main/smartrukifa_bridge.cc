@@ -1,30 +1,24 @@
 #include "smartrukifa_bridge.h"
 #include "application.h"
-#include "assets/lang_config.h"
 #include "audio/audio_codec.h"
 #include "board.h"
 #include "display/display.h"
 #include "system_info.h"
 
 #include <cJSON.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <cstring>
-#include <vector>
 
 #define TAG "SmartRukifa"
 #define SMARTRUKIFA_BRIDGE_BASE_URL "wss://smartrukifa-bridge.roomshift.workers.dev/ws/esp32"
-
-// Send 100ms chunks (1600 samples @ 16kHz = 3200 bytes) -> 10 packets/sec (smooth & TLS-friendly)
-static constexpr size_t kIntercomChunkSamples = 1600;
-static constexpr size_t kIntercomMaxBufferedSamples = 4800;  // Max 300ms cap to protect SRAM
 
 void SmartRukifaBridge::Start() {
     if (started_.exchange(true)) {
         return;
     }
     ESP_LOGI(TAG, "Starting SmartRukifa 24/7 Cloud Bridge task");
-    // 6144-byte stack prevents any TLS/JSON stack overflow on ESP32-C3
-    xTaskCreate(BridgeTaskEntry, "smartrukifa", 6144, this, 3, &task_handle_);
+    xTaskCreate(BridgeTaskEntry, "smartrukifa", 4096, this, 3, &task_handle_);
 }
 
 void SmartRukifaBridge::BridgeTaskEntry(void* arg) {
@@ -37,11 +31,16 @@ void SmartRukifaBridge::FeedMicPcm(const std::vector<int16_t>& pcm) {
         return;
     }
     std::lock_guard<std::mutex> lock(pcm_mutex_);
-    if (tx_pcm_buf_.size() + pcm.size() > kIntercomMaxBufferedSamples) {
-        // Drop oldest buffered samples if network lags to keep SRAM bounded
-        tx_pcm_buf_.clear();
+    for (size_t i = 0; i < pcm.size(); ++i) {
+        if (ring_count_ >= kRingCapacity) {
+            // Overwrite oldest sample if network momentarily stalls
+            ring_head_ = (ring_head_ + 1) % kRingCapacity;
+            ring_count_--;
+        }
+        size_t tail = (ring_head_ + ring_count_) % kRingCapacity;
+        ring_buf_[tail] = pcm[i];
+        ring_count_++;
     }
-    tx_pcm_buf_.insert(tx_pcm_buf_.end(), pcm.begin(), pcm.end());
 }
 
 bool SmartRukifaBridge::Connect() {
@@ -75,10 +74,9 @@ bool SmartRukifaBridge::Connect() {
     std::string mac = SystemInfo::GetMacAddress();
     ws_->SetHeader("Device-Id", mac.c_str());
     ws_->SetHeader("User-Agent", "SmartRukifa-ESP32/1.0");
-    std::string url = SMARTRUKIFA_BRIDGE_BASE_URL;
-    ESP_LOGI(TAG, "Connecting to %s", url.c_str());
+    ESP_LOGI(TAG, "Connecting to %s", SMARTRUKIFA_BRIDGE_BASE_URL);
 
-    if (!ws_->Connect(url.c_str())) {
+    if (!ws_->Connect(SMARTRUKIFA_BRIDGE_BASE_URL)) {
         ESP_LOGW(TAG, "Connect failed, err=%d", ws_->GetLastError());
         ws_.reset();
         connected_.store(false);
@@ -103,17 +101,14 @@ void SmartRukifaBridge::SendHeartbeat() {
         vol = codec->output_volume();
     }
 
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type", "heartbeat");
-    cJSON_AddStringToObject(root, "mac", SystemInfo::GetMacAddress().c_str());
-    cJSON_AddNumberToObject(root, "volume", vol);
-    cJSON_AddBoolToObject(root, "intercom", intercom_active_.load());
-    char* json_str = cJSON_PrintUnformatted(root);
-    if (json_str) {
-        ws_->Send(std::string(json_str));
-        cJSON_free(json_str);
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"type\":\"heartbeat\",\"mac\":\"%s\",\"volume\":%d,\"intercom\":%s}",
+                     SystemInfo::GetMacAddress().c_str(), vol,
+                     intercom_active_.load() ? "true" : "false");
+    if (n > 0) {
+        ws_->Send(std::string(buf, n));
     }
-    cJSON_Delete(root);
 }
 
 void SmartRukifaBridge::SetIntercomActive(bool active) {
@@ -124,21 +119,19 @@ void SmartRukifaBridge::SetIntercomActive(bool active) {
 
     {
         std::lock_guard<std::mutex> lock(pcm_mutex_);
-        tx_pcm_buf_.clear();
+        ring_head_ = 0;
+        ring_count_ = 0;
     }
 
-    auto& app = Application::GetInstance();
-    app.Schedule([active]() {
+    // Show status on OLED without decoding OGG (saves ~16KB SRAM on ESP32-C3)
+    Application::GetInstance().Schedule([active]() {
         auto display = Board::GetInstance().GetDisplay();
-        if (active) {
-            Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
-            if (display) {
-                display->ShowNotification("Intercom Ayah Aktif", 5000);
-                display->SetChatMessage("system", "Intercom Terhubung");
-            }
-        } else {
-            if (display) {
-                display->ShowNotification("Intercom Selesai", 3000);
+        if (display) {
+            if (active) {
+                display->ShowNotification("Intercom Ayah Aktif", 4000);
+                display->SetChatMessage("system", "Intercom Live");
+            } else {
+                display->ShowNotification("Intercom Selesai", 2500);
                 display->SetChatMessage("system", "");
             }
         }
@@ -146,16 +139,17 @@ void SmartRukifaBridge::SetIntercomActive(bool active) {
 }
 
 void SmartRukifaBridge::HandleBinaryAudio(const char* data, size_t len) {
-    if (!data || len < 2 || len > 8192) {
+    if (!data || len < 2 || len > 4096) {
         return;
     }
-    // Incoming 16kHz 16-bit mono PCM from parent's Walkie-Talkie PTT
+    if (esp_get_free_heap_size() < 10000) {
+        return;  // Protect ESP32-C3 SRAM from OOM
+    }
     size_t sample_count = len / sizeof(int16_t);
     std::vector<int16_t> samples(sample_count);
     memcpy(samples.data(), data, sample_count * sizeof(int16_t));
 
-    auto& app = Application::GetInstance();
-    app.Schedule([samples = std::move(samples)]() {
+    Application::GetInstance().Schedule([samples = std::move(samples)]() {
         Application::GetInstance().GetAudioService().PlayPcm(samples.data(), samples.size(), 16000);
     });
 }
@@ -186,8 +180,9 @@ void SmartRukifaBridge::HandleTextCommand(const char* data, size_t len) {
                     if (codec) codec->SetOutputVolume(vol);
                     auto display = Board::GetInstance().GetDisplay();
                     if (display) {
-                        std::string msg = "Volume: " + std::to_string(vol) + "%";
-                        display->ShowNotification(msg.c_str(), 2500);
+                        char msg[32];
+                        snprintf(msg, sizeof(msg), "Volume: %d%%", vol);
+                        display->ShowNotification(msg, 2500);
                     }
                 });
             }
@@ -198,9 +193,6 @@ void SmartRukifaBridge::HandleTextCommand(const char* data, size_t len) {
                 bool is_tts = (cmd == "speak_tts");
                 Application::GetInstance().Schedule([text, is_tts]() {
                     auto display = Board::GetInstance().GetDisplay();
-                    if (is_tts) {
-                        Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
-                    }
                     if (display) {
                         display->ShowNotification(is_tts ? "Pesan Ayah" : "Info OLED", 3000);
                         display->SetChatMessage("system", text.c_str());
@@ -212,7 +204,6 @@ void SmartRukifaBridge::HandleTextCommand(const char* data, size_t len) {
             if (cJSON_IsString(m)) {
                 std::string mode = m->valuestring;
                 Application::GetInstance().Schedule([mode]() {
-                    Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
                     auto display = Board::GetInstance().GetDisplay();
                     if (display) {
                         std::string msg = "Mode: " + mode;
@@ -228,8 +219,7 @@ void SmartRukifaBridge::HandleTextCommand(const char* data, size_t len) {
 
 void SmartRukifaBridge::BridgeTaskLoop() {
     TickType_t last_hb = 0;
-    std::vector<int16_t> chunk;
-    chunk.reserve(kIntercomChunkSamples);
+    int16_t send_buf[kChunkSamples];
 
     while (true) {
         if (!connected_.load() || !ws_ || !ws_->IsConnected()) {
@@ -248,20 +238,26 @@ void SmartRukifaBridge::BridgeTaskLoop() {
         }
 
         if (intercom_active_.load()) {
-            chunk.clear();
+            size_t popped = 0;
             {
                 std::lock_guard<std::mutex> lock(pcm_mutex_);
-                if (tx_pcm_buf_.size() >= kIntercomChunkSamples) {
-                    chunk.assign(tx_pcm_buf_.begin(), tx_pcm_buf_.begin() + kIntercomChunkSamples);
-                    tx_pcm_buf_.erase(tx_pcm_buf_.begin(), tx_pcm_buf_.begin() + kIntercomChunkSamples);
+                if (ring_count_ >= kChunkSamples) {
+                    for (size_t i = 0; i < kChunkSamples; ++i) {
+                        send_buf[i] = ring_buf_[ring_head_];
+                        ring_head_ = (ring_head_ + 1) % kRingCapacity;
+                    }
+                    ring_count_ -= kChunkSamples;
+                    popped = kChunkSamples;
                 }
             }
 
-            if (!chunk.empty() && ws_ && ws_->IsConnected()) {
-                ws_->Send(reinterpret_cast<const char*>(chunk.data()),
-                          chunk.size() * sizeof(int16_t), true);
+            if (popped > 0 && ws_ && ws_->IsConnected()) {
+                if (esp_get_free_heap_size() > 8192) {
+                    ws_->Send(reinterpret_cast<const char*>(send_buf),
+                              popped * sizeof(int16_t), true);
+                }
             }
-            vTaskDelay(pdMS_TO_TICKS(30));
+            vTaskDelay(pdMS_TO_TICKS(15));
         } else {
             vTaskDelay(pdMS_TO_TICKS(200));
         }

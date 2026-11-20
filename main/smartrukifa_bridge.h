@@ -37,6 +37,9 @@ private:
     void SendHeartbeat();
     void SetIntercomActive(bool active);
 
+    static constexpr size_t kChunkSamples = 480;     // 30ms @ 16kHz = 960 bytes
+    static constexpr size_t kRingCapacity = 1920;    // 120ms fixed static ring (no heap alloc)
+
     std::unique_ptr<WebSocket> ws_;
     TaskHandle_t task_handle_ = nullptr;
     std::atomic<bool> started_{false};
@@ -44,7 +47,9 @@ private:
     std::atomic<bool> intercom_active_{false};
 
     std::mutex pcm_mutex_;
-    std::vector<int16_t> tx_pcm_buf_;
+    int16_t ring_buf_[kRingCapacity];
+    size_t ring_head_ = 0;
+    size_t ring_count_ = 0;
 };
 
 #endif  // _SMARTRUKIFA_BRIDGE_H_
