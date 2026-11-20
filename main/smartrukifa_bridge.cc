@@ -56,7 +56,9 @@ bool SmartRukifaBridge::Connect() {
     });
 
     std::string mac = SystemInfo::GetMacAddress();
-    std::string url = std::string(SMARTRUKIFA_BRIDGE_BASE_URL) + "?mac=" + mac;
+    ws_->SetHeader("Device-Id", mac.c_str());
+    ws_->SetHeader("User-Agent", "SmartRukifa-ESP32/1.0");
+    std::string url = SMARTRUKIFA_BRIDGE_BASE_URL;
     ESP_LOGI(TAG, "Connecting to %s", url.c_str());
 
     if (!ws_->Connect(url.c_str())) {
