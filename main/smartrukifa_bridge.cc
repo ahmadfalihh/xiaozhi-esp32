@@ -14,17 +14,34 @@
 #define TAG "SmartRukifa"
 #define SMARTRUKIFA_BRIDGE_BASE_URL "wss://smartrukifa-bridge.roomshift.workers.dev/ws/esp32"
 
+// Send 100ms chunks (1600 samples @ 16kHz = 3200 bytes) -> 10 packets/sec (smooth & TLS-friendly)
+static constexpr size_t kIntercomChunkSamples = 1600;
+static constexpr size_t kIntercomMaxBufferedSamples = 4800;  // Max 300ms cap to protect SRAM
+
 void SmartRukifaBridge::Start() {
     if (started_.exchange(true)) {
         return;
     }
     ESP_LOGI(TAG, "Starting SmartRukifa 24/7 Cloud Bridge task");
-    xTaskCreate(BridgeTaskEntry, "smartrukifa", 4096, this, 3, &task_handle_);
+    // 6144-byte stack prevents any TLS/JSON stack overflow on ESP32-C3
+    xTaskCreate(BridgeTaskEntry, "smartrukifa", 6144, this, 3, &task_handle_);
 }
 
 void SmartRukifaBridge::BridgeTaskEntry(void* arg) {
     static_cast<SmartRukifaBridge*>(arg)->BridgeTaskLoop();
     vTaskDelete(nullptr);
+}
+
+void SmartRukifaBridge::FeedMicPcm(const std::vector<int16_t>& pcm) {
+    if (!intercom_active_.load() || !connected_.load() || pcm.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(pcm_mutex_);
+    if (tx_pcm_buf_.size() + pcm.size() > kIntercomMaxBufferedSamples) {
+        // Drop oldest buffered samples if network lags to keep SRAM bounded
+        tx_pcm_buf_.clear();
+    }
+    tx_pcm_buf_.insert(tx_pcm_buf_.end(), pcm.begin(), pcm.end());
 }
 
 bool SmartRukifaBridge::Connect() {
@@ -105,19 +122,21 @@ void SmartRukifaBridge::SetIntercomActive(bool active) {
         return;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(pcm_mutex_);
+        tx_pcm_buf_.clear();
+    }
+
     auto& app = Application::GetInstance();
     app.Schedule([active]() {
-        auto& app_ref = Application::GetInstance();
         auto display = Board::GetInstance().GetDisplay();
         if (active) {
-            app_ref.GetAudioService().EnableWakeWordDetection(false);
-            app_ref.PlaySound(Lang::Sounds::OGG_POPUP);
+            Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
             if (display) {
                 display->ShowNotification("Intercom Ayah Aktif", 5000);
                 display->SetChatMessage("system", "Intercom Terhubung");
             }
         } else {
-            app_ref.GetAudioService().EnableWakeWordDetection(true);
             if (display) {
                 display->ShowNotification("Intercom Selesai", 3000);
                 display->SetChatMessage("system", "");
@@ -127,7 +146,7 @@ void SmartRukifaBridge::SetIntercomActive(bool active) {
 }
 
 void SmartRukifaBridge::HandleBinaryAudio(const char* data, size_t len) {
-    if (!data || len < 2) {
+    if (!data || len < 2 || len > 8192) {
         return;
     }
     // Incoming 16kHz 16-bit mono PCM from parent's Walkie-Talkie PTT
@@ -209,7 +228,8 @@ void SmartRukifaBridge::HandleTextCommand(const char* data, size_t len) {
 
 void SmartRukifaBridge::BridgeTaskLoop() {
     TickType_t last_hb = 0;
-    std::vector<int16_t> pcm_buf;
+    std::vector<int16_t> chunk;
+    chunk.reserve(kIntercomChunkSamples);
 
     while (true) {
         if (!connected_.load() || !ws_ || !ws_->IsConnected()) {
@@ -222,24 +242,28 @@ void SmartRukifaBridge::BridgeTaskLoop() {
         }
 
         TickType_t now = xTaskGetTickCount();
-        if ((now - last_hb) >= pdMS_TO_TICKS(20000)) {
+        if ((now - last_hb) >= pdMS_TO_TICKS(15000)) {
             SendHeartbeat();
             last_hb = now;
         }
 
         if (intercom_active_.load()) {
-            // Stream 20ms (320 samples @ 16kHz) PCM audio from INMP441 to Bridge
-            auto& audio = Application::GetInstance().GetAudioService();
-            if (audio.ReadAudioData(pcm_buf, 16000, 320) && !pcm_buf.empty()) {
-                if (ws_ && ws_->IsConnected()) {
-                    ws_->Send(reinterpret_cast<const char*>(pcm_buf.data()),
-                              pcm_buf.size() * sizeof(int16_t), true);
+            chunk.clear();
+            {
+                std::lock_guard<std::mutex> lock(pcm_mutex_);
+                if (tx_pcm_buf_.size() >= kIntercomChunkSamples) {
+                    chunk.assign(tx_pcm_buf_.begin(), tx_pcm_buf_.begin() + kIntercomChunkSamples);
+                    tx_pcm_buf_.erase(tx_pcm_buf_.begin(), tx_pcm_buf_.begin() + kIntercomChunkSamples);
                 }
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(20));
             }
+
+            if (!chunk.empty() && ws_ && ws_->IsConnected()) {
+                ws_->Send(reinterpret_cast<const char*>(chunk.data()),
+                          chunk.size() * sizeof(int16_t), true);
+            }
+            vTaskDelay(pdMS_TO_TICKS(30));
         } else {
-            vTaskDelay(pdMS_TO_TICKS(250));
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
     }
 }

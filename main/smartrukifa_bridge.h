@@ -5,8 +5,11 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <atomic>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 class SmartRukifaBridge {
 public:
@@ -18,6 +21,9 @@ public:
     void Start();
     bool IsConnected() const { return connected_.load(); }
     bool IsIntercomActive() const { return intercom_active_.load(); }
+
+    // Called safely from AudioService::ReadAudioData (16kHz mono PCM)
+    void FeedMicPcm(const std::vector<int16_t>& pcm);
 
 private:
     SmartRukifaBridge() = default;
@@ -36,6 +42,9 @@ private:
     std::atomic<bool> started_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> intercom_active_{false};
+
+    std::mutex pcm_mutex_;
+    std::vector<int16_t> tx_pcm_buf_;
 };
 
 #endif  // _SMARTRUKIFA_BRIDGE_H_

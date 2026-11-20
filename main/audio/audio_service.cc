@@ -1,4 +1,5 @@
 #include "audio_service.h"
+#include "smartrukifa_bridge.h"
 #include <algorithm>
 #include <esp_log.h>
 #include <cstring>
@@ -230,6 +231,11 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     }
     audio_debugger_->Feed(data);
 #endif
+
+    // Tap resampled 16kHz mono PCM cleanly for SmartRukifa Intercom (zero I2S contention)
+    if (sample_rate == 16000 && SmartRukifaBridge::GetInstance().IsIntercomActive()) {
+        SmartRukifaBridge::GetInstance().FeedMicPcm(data);
+    }
 
     return true;
 }
