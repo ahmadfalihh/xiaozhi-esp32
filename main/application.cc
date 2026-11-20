@@ -1,4 +1,5 @@
 #include "application.h"
+#include "smartrukifa_bridge.h"
 #include "assets.h"
 #include "assets/lang_config.h"
 #include "audio_codec.h"
@@ -345,6 +346,9 @@ void Application::HandleActivationDoneEvent() {
         // Boards with custom boot audio already played it during Initialize().
         Schedule([this]() { audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS); });
     }
+
+    // Start SmartRukifa 24/7 Cloud Bridge for remote control & intercom
+    SmartRukifaBridge::GetInstance().Start();
 }
 
 void Application::ActivationTask() {
