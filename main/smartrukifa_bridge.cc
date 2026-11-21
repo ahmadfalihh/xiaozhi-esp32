@@ -8,17 +8,24 @@
 #include <cJSON.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_wifi.h>
 #include <cstring>
 
 #define TAG "SmartRukifa"
-#define SMARTRUKIFA_BRIDGE_BASE_URL "wss://smartrukifa-bridge.roomshift.workers.dev/ws/esp32"
+// Use plain ws:// (port 80) on Cloudflare Workers to save ~24KB of precious ESP32-C3 SRAM (no 2nd mbedTLS context!)
+#define SMARTRUKIFA_BRIDGE_BASE_URL "ws://smartrukifa-bridge.roomshift.workers.dev/ws/esp32"
 
 void SmartRukifaBridge::Start() {
     if (started_.exchange(true)) {
         return;
     }
-    ESP_LOGI(TAG, "Starting SmartRukifa 24/7 Cloud Bridge task");
-    xTaskCreate(BridgeTaskEntry, "smartrukifa", 4096, this, 3, &task_handle_);
+    // Famous ESP32-C3 SuperMini stability fix: cap Wi-Fi TX power to 10 dBm (40 * 0.25dBm)
+    // to prevent LDO brownout spikes & ceramic antenna self-interference, and avoid deep MAX_MODEM beacon drops.
+    esp_wifi_set_max_tx_power(40);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+    ESP_LOGI(TAG, "Starting SmartRukifa 24/7 Cloud Bridge task (low-RAM ws:// mode)");
+    xTaskCreate(BridgeTaskEntry, "smartrukifa", 3072, this, 3, &task_handle_);
 }
 
 void SmartRukifaBridge::BridgeTaskEntry(void* arg) {
