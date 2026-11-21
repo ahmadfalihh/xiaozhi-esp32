@@ -10,6 +10,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate default Wi-Fi credentials header
+        env:
+          DEFAULT_WIFI_LIST: ${{ secrets.DEFAULT_WIFI_LIST }}
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+          import pathlib
+
+          raw = os.environ.get("DEFAULT_WIFI_LIST", "").strip()
+          if not raw:
+              print("DEFAULT_WIFI_LIST secret not set; skipping wifi_secrets.h")
+              raise SystemExit(0)
+
+          entries = json.loads(raw)
+
+          def c_escape(value: str) -> str:
+              return value.replace("\\", "\\\\").replace('"', '\\"')
+
+          items = []
+          for entry in entries:
+              ssid = str(entry.get("ssid", ""))
+              password = str(entry.get("password", ""))
+              if ssid:
+                  items.append(f'    {{"{c_escape(ssid)}", "{c_escape(password)}"}}')
+
+          if items:
+              header = (
+                  "#pragma once\n"
+                  "// Auto-generated at build time from GitHub Actions secrets. Do not commit.\n"
+                  "#define POCKET_DEFAULT_WIFI_CREDENTIALS \\\n"
+                  + ", \\\n".join(items)
+                  + "\n"
+              )
+              out = pathlib.Path("main/boards/pocket-wall-e-c3/wifi_secrets.h")
+              out.write_text(header, encoding="utf-8")
+              print(f"Generated {out} with {len(items)} default Wi-Fi entries")
+          EOF
+
       - name: Build firmware
         run: |
           git config --global --add safe.directory '*'

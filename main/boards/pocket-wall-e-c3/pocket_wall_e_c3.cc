@@ -10,8 +10,13 @@
 #include <esp_lcd_panel_vendor.h>
 #include <esp_log.h>
 #include <esp_wifi.h>
+#include <ssid_manager.h>
 #include <cstdint>
 #include <climits>
+
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#endif
 
 #define TAG "PocketWallEC3"
 
@@ -166,6 +171,41 @@ public:
         (void)level;
         WifiBoard::SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
         esp_wifi_set_max_tx_power(40);
+    }
+
+    void EnsureDefaultWifiCredentials() {
+#ifdef POCKET_DEFAULT_WIFI_CREDENTIALS
+        struct DefaultWifiCredential {
+            const char* ssid;
+            const char* password;
+        };
+        static constexpr DefaultWifiCredential kDefaults[] = {
+            POCKET_DEFAULT_WIFI_CREDENTIALS
+        };
+
+        auto& ssid_manager = SsidManager::GetInstance();
+        for (const auto& cred : kDefaults) {
+            if (!cred.ssid || cred.ssid[0] == '\0') {
+                continue;
+            }
+            bool matched = false;
+            for (const auto& item : ssid_manager.GetSsidList()) {
+                if (item.ssid == cred.ssid && item.password == cred.password) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                ESP_LOGI(TAG, "Seeding default Wi-Fi SSID: %s", cred.ssid);
+                ssid_manager.AddSsid(cred.ssid, cred.password);
+            }
+        }
+#endif
+    }
+
+    void StartNetwork() override {
+        EnsureDefaultWifiCredentials();
+        WifiBoard::StartNetwork();
     }
 
     AudioCodec* GetAudioCodec() override {
