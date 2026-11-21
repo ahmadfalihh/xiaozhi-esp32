@@ -9,6 +9,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_log.h>
+#include <esp_wifi.h>
 #include <cstdint>
 #include <climits>
 
@@ -151,11 +152,20 @@ private:
     }
 
 public:
-    PocketWallEC3Board() : action_button_(ACTION_BUTTON_GPIO) {
+    // Kid-proof 6-second long press (prevents kids from accidentally triggering Wi-Fi config AP mode)
+    PocketWallEC3Board() : action_button_(ACTION_BUTTON_GPIO, false, 6000) {
         InitializeDisplayI2c();
         InitializeDisplay();
         InitializeButton();
         ESP_LOGI(TAG, "Pocket Wall-E C3 initialized");
+    }
+
+    // Override power save: NEVER enter MAX_MODEM sleep on ESP32-C3 SuperMini (prevents beacon timeout drops)
+    // and cap Wi-Fi TX power to 10 dBm (40 * 0.25dBm) to prevent LDO brownouts & antenna self-interference.
+    void SetPowerSaveLevel(PowerSaveLevel level) override {
+        (void)level;
+        WifiBoard::SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        esp_wifi_set_max_tx_power(40);
     }
 
     AudioCodec* GetAudioCodec() override {

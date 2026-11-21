@@ -12,20 +12,18 @@
 #include <cstring>
 
 #define TAG "SmartRukifa"
-// Use plain ws:// (port 80) on Cloudflare Workers to save ~24KB of precious ESP32-C3 SRAM (no 2nd mbedTLS context!)
+// Plain ws:// (port 80) saves ~24KB SRAM (no 2nd mbedTLS context)
 #define SMARTRUKIFA_BRIDGE_BASE_URL "ws://smartrukifa-bridge.roomshift.workers.dev/ws/esp32"
 
 void SmartRukifaBridge::Start() {
     if (started_.exchange(true)) {
         return;
     }
-    // Famous ESP32-C3 SuperMini stability fix: cap Wi-Fi TX power to 10 dBm (40 * 0.25dBm)
-    // to prevent LDO brownout spikes & ceramic antenna self-interference, and avoid deep MAX_MODEM beacon drops.
     esp_wifi_set_max_tx_power(40);
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
-    ESP_LOGI(TAG, "Starting SmartRukifa 24/7 Cloud Bridge task (low-RAM ws:// mode)");
-    xTaskCreate(BridgeTaskEntry, "smartrukifa", 3072, this, 3, &task_handle_);
+    ESP_LOGI(TAG, "Starting SmartRukifa 24/7 Cloud Bridge (ultra-low RAM v6)");
+    xTaskCreate(BridgeTaskEntry, "smartrukifa", 2560, this, 3, &task_handle_);
 }
 
 void SmartRukifaBridge::BridgeTaskEntry(void* arg) {
@@ -38,9 +36,11 @@ void SmartRukifaBridge::FeedMicPcm(const std::vector<int16_t>& pcm) {
         return;
     }
     std::lock_guard<std::mutex> lock(pcm_mutex_);
+    if (ring_buf_.size() != kRingCapacity) {
+        return;
+    }
     for (size_t i = 0; i < pcm.size(); ++i) {
         if (ring_count_ >= kRingCapacity) {
-            // Overwrite oldest sample if network momentarily stalls
             ring_head_ = (ring_head_ + 1) % kRingCapacity;
             ring_count_--;
         }
@@ -119,6 +119,11 @@ void SmartRukifaBridge::SendHeartbeat() {
 }
 
 void SmartRukifaBridge::SetIntercomActive(bool active) {
+    if (active && esp_get_free_heap_size() < 12000) {
+        ESP_LOGW(TAG, "Skip intercom_start: low heap (%u)", (unsigned)esp_get_free_heap_size());
+        return;
+    }
+
     bool prev = intercom_active_.exchange(active);
     if (prev == active) {
         return;
@@ -128,9 +133,14 @@ void SmartRukifaBridge::SetIntercomActive(bool active) {
         std::lock_guard<std::mutex> lock(pcm_mutex_);
         ring_head_ = 0;
         ring_count_ = 0;
+        if (active) {
+            ring_buf_.assign(kRingCapacity, 0);
+        } else {
+            // Release all intercom RAM immediately when idle/chatting!
+            std::vector<int16_t>().swap(ring_buf_);
+        }
     }
 
-    // Show status on OLED without decoding OGG (saves ~16KB SRAM on ESP32-C3)
     Application::GetInstance().Schedule([active]() {
         auto display = Board::GetInstance().GetDisplay();
         if (display) {
@@ -149,8 +159,8 @@ void SmartRukifaBridge::HandleBinaryAudio(const char* data, size_t len) {
     if (!data || len < 2 || len > 4096) {
         return;
     }
-    if (esp_get_free_heap_size() < 10000) {
-        return;  // Protect ESP32-C3 SRAM from OOM
+    if (esp_get_free_heap_size() < 12000) {
+        return;
     }
     size_t sample_count = len / sizeof(int16_t);
     std::vector<int16_t> samples(sample_count);
@@ -226,7 +236,6 @@ void SmartRukifaBridge::HandleTextCommand(const char* data, size_t len) {
 
 void SmartRukifaBridge::BridgeTaskLoop() {
     TickType_t last_hb = 0;
-    int16_t send_buf[kChunkSamples];
 
     while (true) {
         if (!connected_.load() || !ws_ || !ws_->IsConnected()) {
@@ -245,28 +254,26 @@ void SmartRukifaBridge::BridgeTaskLoop() {
         }
 
         if (intercom_active_.load()) {
-            size_t popped = 0;
+            std::vector<int16_t> send_buf;
             {
                 std::lock_guard<std::mutex> lock(pcm_mutex_);
-                if (ring_count_ >= kChunkSamples) {
+                if (ring_buf_.size() == kRingCapacity && ring_count_ >= kChunkSamples) {
+                    send_buf.resize(kChunkSamples);
                     for (size_t i = 0; i < kChunkSamples; ++i) {
                         send_buf[i] = ring_buf_[ring_head_];
                         ring_head_ = (ring_head_ + 1) % kRingCapacity;
                     }
                     ring_count_ -= kChunkSamples;
-                    popped = kChunkSamples;
                 }
             }
 
-            if (popped > 0 && ws_ && ws_->IsConnected()) {
-                if (esp_get_free_heap_size() > 8192) {
-                    ws_->Send(reinterpret_cast<const char*>(send_buf),
-                              popped * sizeof(int16_t), true);
-                }
+            if (!send_buf.empty() && ws_ && ws_->IsConnected() && esp_get_free_heap_size() > 10000) {
+                ws_->Send(reinterpret_cast<const char*>(send_buf.data()),
+                          send_buf.size() * sizeof(int16_t), true);
             }
             vTaskDelay(pdMS_TO_TICKS(15));
         } else {
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(250));
         }
     }
 }

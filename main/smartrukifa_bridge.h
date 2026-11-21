@@ -37,8 +37,8 @@ private:
     void SendHeartbeat();
     void SetIntercomActive(bool active);
 
-    static constexpr size_t kChunkSamples = 480;     // 30ms @ 16kHz = 960 bytes
-    static constexpr size_t kRingCapacity = 1920;    // 120ms fixed static ring (no heap alloc)
+    static constexpr size_t kChunkSamples = 480;   // 30ms @ 16kHz = 960 bytes
+    static constexpr size_t kRingCapacity = 1440;  // 90ms ring, allocated ONLY during active intercom!
 
     std::unique_ptr<WebSocket> ws_;
     TaskHandle_t task_handle_ = nullptr;
@@ -47,7 +47,7 @@ private:
     std::atomic<bool> intercom_active_{false};
 
     std::mutex pcm_mutex_;
-    int16_t ring_buf_[kRingCapacity];
+    std::vector<int16_t> ring_buf_;
     size_t ring_head_ = 0;
     size_t ring_count_ = 0;
 };
