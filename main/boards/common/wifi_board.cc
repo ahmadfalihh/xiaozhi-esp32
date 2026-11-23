@@ -106,11 +106,9 @@ void WifiBoard::TryWifiConnect() {
     bool have_ssid = !ssid_manager.GetSsidList().empty();
 
     if (have_ssid) {
-        // Start connection attempt with timeout
-        ESP_LOGI(TAG, "Starting WiFi connection attempt");
-        if (connect_timer_ != nullptr) {
-            esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
-        }
+        // Never time out into Config AP when saved SSIDs exist; keep scanning and auto-reconnecting indefinitely.
+        // User can still enter Wi-Fi Config AP manually anytime via 6-second long press.
+        ESP_LOGI(TAG, "Starting WiFi auto-connect (persistent scan)");
         WifiManager::GetInstance().StartStation();
     } else {
         // No SSID configured, enter config mode

@@ -148,7 +148,8 @@ private:
         action_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
-                EnterWifiConfigMode();
+                // Ignore accidental short clicks while auto-connecting to Wi-Fi;
+                // use 6-second long press to enter Wi-Fi Config AP mode.
                 return;
             }
             app.ToggleChatState();

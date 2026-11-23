@@ -22,7 +22,7 @@ void SmartRukifaBridge::Start() {
     esp_wifi_set_max_tx_power(40);
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    ESP_LOGI(TAG, "Starting SmartRukifa 24/7 Cloud Bridge (ultra-low RAM v6)");
+    ESP_LOGI(TAG, "Starting SmartRukifa 24/7 Cloud Bridge (ultra-low RAM v7)");
     xTaskCreate(BridgeTaskEntry, "smartrukifa", 2560, this, 3, &task_handle_);
 }
 
